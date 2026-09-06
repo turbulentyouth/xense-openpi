@@ -356,6 +356,46 @@ class PI0Pytorch(nn.Module):
             images, img_masks, lang_tokens, lang_masks, state, actions, noise=noise, time=time
         )
 
+    @torch.no_grad()
+    def extract_prefix_hidden(self, observation, *, image_only: bool = False) -> tuple[Tensor, Tensor]:
+        """Run the prefix (image + language) forward and return PaliGemma's prefix hidden states.
+
+        Used by RLT token training/inference, where a frozen VLA supplies the
+        features the RL-token encoder-decoder compresses and reconstructs.
+
+        Returns ``(prefix_hidden, prefix_pad_masks)`` with shapes ``[B, L, width]``
+        and ``[B, L]``. With ``image_only=True`` the trailing language segment is
+        dropped (mirrors RLinf's ``rlt_image_only``).
+        """
+        images, img_masks, lang_tokens, lang_masks, _state = self._preprocess_observation(observation, train=False)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+
+        (prefix_hidden, _), _ = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=False,
+        )
+
+        if image_only:
+            num_image_tokens = prefix_hidden.shape[1] - lang_tokens.shape[1]
+            prefix_hidden = prefix_hidden[:, :num_image_tokens]
+            prefix_pad_masks = prefix_pad_masks[:, :num_image_tokens]
+
+        return prefix_hidden, prefix_pad_masks
+
     def _run_prefix_suffix(
         self,
         prefix_embs,
