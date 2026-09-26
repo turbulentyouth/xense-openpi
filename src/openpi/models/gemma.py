@@ -341,7 +341,7 @@ class Attention(nn.Module):
     cudnn_attention_dtype: str = "bfloat16"
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, collect_attention=False):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -419,19 +419,36 @@ class Attention(nn.Module):
             big_neg = -2.3819763e38  # See gemma/modules.py
             masked_logits = jnp.where(mask[:, :, None, :, :], logits, big_neg)
 
-            probs = jax.nn.softmax(masked_logits, axis=-1).astype(v.dtype)
+            probs = jax.nn.softmax(masked_logits, axis=-1)
 
-            encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v).astype(dtype)
-            return einops.rearrange(encoded, "B T K G H -> B T (K G) H")
+            encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs.astype(v.dtype), v).astype(dtype)
+            encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
+            if collect_attention:
+                # Merge the (K, G) head axes into a single per-query-head axis: [B, K*G, T, S].
+                # Kept in float32 (the softmax compute dtype); T and S differ under KV-cache
+                # inference, where queries are the suffix and keys are cached prefix + suffix.
+                probs = einops.rearrange(probs, "B K G T S -> B (K G) T S")
+            else:
+                probs = None
+            return encoded, probs
 
         operands = (q, k, v, attn_mask)
-        if self.use_cudnn_attention and kv_cache is None:
-            encoded = cudnn_attention(operands)
+        # Collecting attention probabilities forces the explicit path: the cuDNN fused
+        # kernel does not expose per-head probabilities, and they cannot be recovered
+        # from its output.
+        if self.use_cudnn_attention and kv_cache is None and not collect_attention:
+            encoded, attn_probs = cudnn_attention(operands), None
         else:
-            encoded = explicit_attention(operands)
+            encoded, attn_probs = explicit_attention(operands)
 
         out = []
+        vnorms = []
         start = 0
+        if collect_attention:
+            # Groups within one kv head share the same value vector; expand v to one
+            # slice per query head so it lines up with the per-head W_o below.
+            groups = self.configs[0].num_heads // self.configs[0].num_kv_heads
+            v_full = jnp.repeat(v, groups, axis=2)  # [B, S, N, H]
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is not None:
                 end = start + x.shape[1]
@@ -442,11 +459,20 @@ class Attention(nn.Module):
                     lora_config=config.lora_configs.get("attn"),
                 )
                 out.append(out_einsum("BTNH,NHD->BTD", encoded[:, start:end]))
+                if collect_attention:
+                    # How much key s actually injects into this expert's queries via
+                    # head n: ||W_o[n] @ v[s]|| over the model width. Attention
+                    # probabilities alone (the Q/K path) cannot capture this -- a key
+                    # with high probability but a small value vector has little effect.
+                    vproj = out_einsum("BSNH,NHD->BSND", v_full)
+                    vnorms.append(
+                        einops.rearrange(jnp.linalg.norm(vproj.astype(jnp.float32), axis=-1), "B S N -> B N S")
+                    )
                 start = end
             else:
                 out.append(None)
 
-        return out, (k, v)
+        return out, (k, v), attn_probs, (vnorms if collect_attention else None)
 
 
 @at.typecheck
@@ -492,7 +518,7 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, collect_attention=False):
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -513,7 +539,7 @@ class Block(nn.Module):
             pre_attn.append(x)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        post_attn, kv_cache, attn_probs, attn_vnorms = attn(pre_attn, positions, attn_mask, kv_cache, collect_attention)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -540,7 +566,12 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
-        return xs, kv_cache
+        # Per-layer attention probabilities and per-key value norms of this block, so
+        # that `Module` can stack them across layers via nn.scan's out_axes.
+        # `collect_attention` is static (see the remat/scan setup in Module.setup): when
+        # False both scan outputs are None and the compiled graph is identical to
+        # before the switch existed.
+        return xs, (kv_cache, attn_probs, attn_vnorms)
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -571,7 +602,12 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(5,),  # 0=self, 6=deterministic
+            # nn.remat counts `self` as argument 0 and subtracts one before handing the
+            # indices to jax.checkpoint, so 5 is adarms_cond and 7 is collect_attention.
+            # (5,) predates this file's per-layer outputs and is kept as-is so the
+            # compiled training graph does not change; 7 has to be static because
+            # Block branches on it in Python.
+            static_argnums=(5, 7),
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -584,7 +620,8 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+                nn.broadcast,
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, 5=collect_attention
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -610,19 +647,53 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        return_attention: bool = False,
+    ) -> (
+        tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]
+        | tuple[
+            Sequence[at.Float[at.Array, "b _t _d"] | None],
+            KVCache,
+            at.Float[at.Array, "l b h _t _s"],
+            list[at.Float[at.Array, "l b h _s"]],
+        ]
+    ):
+        """Run all experts through the stacked blocks.
+
+        With ``return_attention=True`` two extra elements are returned:
+
+        - the explicit-path attention probabilities of every block, stacked as
+          ``[depth, b, h, t, s]`` in float32, where ``h = num_heads`` (the per-kv-head
+          groups are merged), ``t`` is the query length and ``s`` the key/value
+          length. ``t != s`` under KV-cache inference, where queries are the suffix
+          and keys are the cached prefix plus suffix.
+        - per present expert, the per-key projected value norms
+          ``||W_o[n] @ v[s]||`` stacked as ``[depth, b, h, s]`` float32 -- the
+          magnitude each key actually injects through head ``n``. Multiplying the
+          probabilities by these norms (and normalising per query) gives a
+          value-aware influence measure instead of the raw Q/K softmax.
+
+        The cuDNN fused kernel cannot expose probabilities, so this switch forces
+        the explicit attention path even when ``use_cudnn_attention`` is set.
+        The switch is static: when False the compiled graph is identical to before it
+        existed.
+        """
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        embedded, (kv_cache, attention, value_norm) = self.layers(
+            embedded, kv_cache, positions, mask, adarms_cond, deterministic, return_attention
+        )
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
-        return [
+        outputs = [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        if return_attention:
+            return outputs, kv_cache, attention, value_norm
+        return outputs, kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
