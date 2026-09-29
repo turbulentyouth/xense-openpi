@@ -50,22 +50,28 @@ import jax.numpy as jnp  # noqa: E402
 import optax  # noqa: E402
 
 from test.tactile_counterfactual.tactile_linear_probe import logistic_fit  # noqa: E402
+from openpi.models.tactile_refiner import (  # noqa: E402
+    ACTION_DIMS,
+    DELTA_SCALE,
+    FRAME_DIM,
+    GRU_DIM,
+    H_DIM,
+    TAC_DIM,
+    RefinerV11,
+)
 
 logger = logging.getLogger("train_refiner_v11")
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 SEGMENTS = REPO_ROOT / "outputs" / "stage_a" / "aux_labels.report.json"
 
-ACTION_DIMS = 1600
-TAC_DIM = 1024
-FRAME_DIM = 256
-GRU_DIM = 128
-H_DIM = 512
-DELTA_SCALE = 2.0
+# Model architecture constants (ACTION_DIMS/TAC_DIM/FRAME_DIM/GRU_DIM/H_DIM/
+# DELTA_SCALE) and the TinyGRU/RefinerV11 classes live in
+# src/openpi/models/tactile_refiner.py -- the single source of truth shared with
+# the serving wrapper (openpi.policies.tactile_refiner_policy).
 AUX_WEIGHT = 0.1
 WINDOW_WEIGHT = 3.0
 FAR_THRESHOLD = 0.7
-HISTORY = 4
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,54 +96,9 @@ def parse_args() -> argparse.Namespace:
 
 
 # --------------------------------------------------------------------------- #
-# Model                                                                       #
+# Model: TinyGRU + RefinerV11 are imported from openpi.models.tactile_refiner  #
+# (single source of truth, shared with serving).                               #
 # --------------------------------------------------------------------------- #
-
-
-class TinyGRU(nnx.Module):
-    def __init__(self, rngs: nnx.Rngs, din: int, dh: int):
-        self.x2g = nnx.Linear(din, 3 * dh, rngs=rngs)
-        self.h2g = nnx.Linear(dh, 3 * dh, use_bias=False, rngs=rngs)
-        self.dh = dh
-
-    def __call__(self, xs: jax.Array) -> jax.Array:
-        """xs [B, T, D] -> final hidden state [B, dh]."""
-        h = jnp.zeros((xs.shape[0], self.dh), dtype=xs.dtype)
-        for t in range(xs.shape[1]):
-            xr, xz, xn = jnp.split(self.x2g(xs[:, t]), 3, axis=-1)
-            hr, hz, hn = jnp.split(self.h2g(h), 3, axis=-1)
-            r = jax.nn.sigmoid(xr + hr)
-            z = jax.nn.sigmoid(xz + hz)
-            n = jnp.tanh(xn + r * hn)
-            h = (1 - z) * n + z * h
-        return h
-
-
-class RefinerV11(nnx.Module):
-    def __init__(self, rngs: nnx.Rngs, history: str = "gru"):
-        self.history = history
-        self.frame_fc = nnx.Linear(TAC_DIM, FRAME_DIM, rngs=rngs)
-        z_dim = GRU_DIM if history == "gru" else FRAME_DIM
-        if history == "gru":
-            self.gru = TinyGRU(rngs, FRAME_DIM, GRU_DIM)
-        self.film = nnx.Linear(z_dim, 2 * H_DIM, rngs=rngs)
-        self.aux = nnx.Linear(z_dim, 2, rngs=rngs)
-        self.a_fc = nnx.Linear(ACTION_DIMS, H_DIM, rngs=rngs)
-        self.mlp1 = nnx.Linear(H_DIM, H_DIM, rngs=rngs)
-        self.mlp2 = nnx.Linear(H_DIM, ACTION_DIMS, rngs=rngs)
-
-    def __call__(self, tac_hist: jax.Array, a_vla: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """tac_hist [B, T, views, 1024] (standardised), a_vla [B, 1600]."""
-        x = tac_hist.mean(axis=2)  # pool the 4 views -> [B, T, 1024]
-        x = nnx.gelu(self.frame_fc(x))  # shared per-frame projection -> [B, T, 256]
-        z = self.gru(x) if self.history == "gru" else x.mean(axis=1)
-        gamma, beta = jnp.split(self.film(z), 2, axis=-1)
-        logits = self.aux(z)
-        h = nnx.gelu(self.a_fc(a_vla))
-        h = gamma * h + beta
-        out = self.mlp2(nnx.gelu(self.mlp1(h)))
-        delta = DELTA_SCALE * jnp.tanh(out / DELTA_SCALE)
-        return a_vla + delta, logits
 
 
 # --------------------------------------------------------------------------- #
